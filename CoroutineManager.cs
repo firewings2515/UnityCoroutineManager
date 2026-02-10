@@ -131,7 +131,10 @@ public class CoroutineManager : MonoBehaviour
                 // Skip the Run method and extension methods
                 if (method.Name == "Run" || 
                     method.Name == "RunManaged" ||
-                    method.DeclaringType == typeof(CoroutineManager))
+                    method.DeclaringType == typeof(CoroutineManager) ||
+                    method.DeclaringType == typeof(CoroutineHandle) ||
+                    method.DeclaringType == typeof(MonoBehaviourExtensions) ||
+                    method.DeclaringType == typeof(CoroutineTraceMono))
                     continue;
                 
                 // Found the actual caller
@@ -167,7 +170,7 @@ public class CoroutineManager : MonoBehaviour
 #if ODIN_INSPECTOR && (UNITY_EDITOR || DLL_MODE)
     [Sirenix.OdinInspector.ListDrawerSettings(
                 HideAddButton = true, HideRemoveButton = true,
-                IsReadOnly = true, ShowItemCount = true)]
+                IsReadOnly = true, ShowItemCount = true, ListElementLabelName = "HandlerInfo")]
     [Sirenix.OdinInspector.Title("場景事件註冊表")]
     [Sirenix.OdinInspector.ShowInInspector]
     [Sirenix.OdinInspector.Searchable]
@@ -202,7 +205,7 @@ public class CoroutineManager : MonoBehaviour
     /// <summary>
     /// Register and run a coroutine on the owner MonoBehaviour
     /// </summary>
-    public CoroutineHandle Run(MonoBehaviour owner, IEnumerator routine, CoroutineStartPolicy policy = CoroutineStartPolicy.AllowMultiple)
+   public Coroutine Run(MonoBehaviour owner, IEnumerator routine, CoroutineStartPolicy policy = CoroutineStartPolicy.StopExisting)
     {
         if (owner == null)
         {
@@ -213,22 +216,26 @@ public class CoroutineManager : MonoBehaviour
         string coroutineName = ExtractMethodName(routine);
         
         // Check existing based on policy
-        bool hasExisting = IsRunning(coroutineName, owner);
-        
+        bool hasExisting = IsRunning(owner, coroutineName);
+        if (hasExisting)
+        {
+            Debug.Log($"[CoroutineManager] Coroutine '{coroutineName}' is already running on {owner.name}");
+        }
         switch (policy)
         {
             case CoroutineStartPolicy.StopExisting:
                 if (hasExisting)
                 {
-                    Stop(coroutineName, owner);
+                    Stop(owner, coroutineName);
                 }
                 break;
                 
             case CoroutineStartPolicy.UseExisting:
                 if (hasExisting)
                 {
-                    // Return existing handle instead of creating new one
-                    return GetHandle(coroutineName, owner);
+                    // Return existing coroutine instead of creating new one
+                    var existingHandle = GetHandle(owner, coroutineName);
+                    return existingHandle?.Coroutine;
                 }
                 break;
                 
@@ -239,15 +246,17 @@ public class CoroutineManager : MonoBehaviour
         
         var handle = new CoroutineHandle(coroutineName, owner);
 
+        // Start coroutine and store reference
         handle.Coroutine = owner.StartCoroutine(WrapCoroutine(routine, handle));
-
+        
         if (!runningCoroutines.ContainsKey(coroutineName))
         {
             runningCoroutines[coroutineName] = new List<CoroutineHandle>();
         }
         runningCoroutines[coroutineName].Add(handle);
 
-        return handle;
+        // Return the Coroutine object for Unity API compatibility
+        return handle.Coroutine;
     }
 
 
@@ -346,7 +355,7 @@ public class CoroutineManager : MonoBehaviour
     /// <summary>
     /// Stop coroutines with the given name and owner
     /// </summary>
-    public void Stop(string name, MonoBehaviour owner)
+    public void Stop(MonoBehaviour owner, string name)
     {
         if (runningCoroutines.TryGetValue(name, out var list))
         {
@@ -410,7 +419,7 @@ public class CoroutineManager : MonoBehaviour
     /// <summary>
     /// Check if a coroutine with the given name and owner is running
     /// </summary>
-    public bool IsRunning(string name, MonoBehaviour owner)
+    public bool IsRunning(MonoBehaviour owner, string name)
     {
         if (runningCoroutines.TryGetValue(name, out var list))
         {
@@ -422,7 +431,7 @@ public class CoroutineManager : MonoBehaviour
     /// <summary>
     /// Get the first running coroutine handle with the given name and owner
     /// </summary>
-    public CoroutineHandle GetHandle(string name, MonoBehaviour owner)
+    public CoroutineHandle GetHandle(MonoBehaviour owner, string name)
     {
         if (runningCoroutines.TryGetValue(name, out var list))
         {
@@ -446,13 +455,32 @@ public class CoroutineManager : MonoBehaviour
     /// <summary>
     /// Get all running coroutine handles with the given name and owner
     /// </summary>
-    public List<CoroutineHandle> GetHandles(string name, MonoBehaviour owner)
+    public List<CoroutineHandle> GetHandles(MonoBehaviour owner, string name)
     {
         if (runningCoroutines.TryGetValue(name, out var list))
         {
             return list.Where(h => h.Owner == owner).ToList();
         }
         return new List<CoroutineHandle>();
+    }
+
+    /// <summary>
+    /// Get handle by Coroutine reference (for StopCoroutine compatibility)
+    /// </summary>
+    public CoroutineHandle GetHandleByCoroutine(MonoBehaviour owner, Coroutine coroutine)
+    {
+        if (coroutine == null || owner == null) return null;
+        
+        foreach (var list in runningCoroutines.Values)
+        {
+            var handle = list.FirstOrDefault(h => h.Owner == owner && h.Coroutine == coroutine);
+            if (handle != null)
+            {
+                return handle;
+            }
+        }
+        
+        return null;
     }
 
     public List<CoroutineHandle> GetAll()
@@ -526,4 +554,70 @@ public class CoroutineManager : MonoBehaviour
         return GetRunningCount() + GetCompletedCount();
     }
 #endif
+}
+
+public static class MonoBehaviourExtensions
+{
+    /// <summary>
+    /// Start a managed coroutine with automatic tracking
+    /// </summary>
+    public static Coroutine StartManagedCoroutine(
+        this MonoBehaviour owner, 
+        IEnumerator routine, 
+        CoroutineManager.CoroutineStartPolicy policy = CoroutineManager.CoroutineStartPolicy.AllowMultiple)
+    {
+        return CoroutineManager.Instance.Run(owner, routine, policy);
+    }
+    
+    /// <summary>
+    /// Stop a managed coroutine by name
+    /// </summary>
+    public static void StopManagedCoroutine(this MonoBehaviour owner, string name)
+    {
+        CoroutineManager.Instance.Stop(owner, name);
+    }
+    
+    /// <summary>
+    /// Stop a managed coroutine by Coroutine reference
+    /// </summary>
+    public static void StopManagedCoroutine(this MonoBehaviour owner, Coroutine routine)
+    {
+        var handle = CoroutineManager.Instance.GetHandleByCoroutine(owner, routine);
+        if (handle != null)
+        {
+            CoroutineManager.Instance.Stop(handle);
+        }
+    }
+    
+    /// <summary>
+    /// Stop all managed coroutines for this owner
+    /// </summary>
+    public static void StopAllManagedCoroutines(this MonoBehaviour owner)
+    {
+        CoroutineManager.Instance.StopAllByOwner(owner);
+    }
+    
+    /// <summary>
+    /// Check if a managed coroutine is running
+    /// </summary>
+    public static bool IsManagedCoroutineRunning(this MonoBehaviour owner, string name)
+    {
+        return CoroutineManager.Instance.IsRunning(owner, name);
+    }
+    
+    /// <summary>
+    /// Get the CoroutineHandle for advanced tracking (optional)
+    /// </summary>
+    public static CoroutineManager.CoroutineHandle GetManagedCoroutineHandle(this MonoBehaviour owner, string name)
+    {
+        return CoroutineManager.Instance.GetHandle(owner, name);
+    }
+    
+    /// <summary>
+    /// Get the CoroutineHandle from a Coroutine reference (optional)
+    /// </summary>
+    public static CoroutineManager.CoroutineHandle GetManagedCoroutineHandle(this MonoBehaviour owner, Coroutine routine)
+    {
+        return CoroutineManager.Instance.GetHandleByCoroutine(owner, routine);
+    }
 }
